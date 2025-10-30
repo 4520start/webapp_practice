@@ -3,11 +3,13 @@ package main
 import (
     "net/http"
     "os"
+    "time" 
 
     "github.com/labstack/echo/v4"
     "github.com/labstack/echo/v4/middleware"
     "gorm.io/driver/postgres"
     "gorm.io/gorm"
+    "golang.org/x/crypto/bcrypt"
 )
 
 type Organization struct {
@@ -19,6 +21,13 @@ type User struct {
     ID    uint   `json:"id" gorm:"primaryKey"`
     Name  string `json:"name"`
     OrgID uint   `json:"org_id"`
+}
+
+type Account struct {
+    ID        uint      `json:"id" gorm:"primaryKey"`
+    Username  string    `json:"username" gorm:"unique;not null"`
+    Password  string    `json:"-" gorm:"not null"` // JSONには含めない
+    CreatedAt time.Time `json:"created_at"`
 }
 
 var db *gorm.DB
@@ -33,13 +42,21 @@ func main() {
     if err != nil {
         panic(err)
     }
-    db.AutoMigrate(&Organization{}, &User{})
+    if err := db.AutoMigrate(&Organization{}, &User{}, &Account{}); err != nil {
+        panic(err)
+    }
+
     e := echo.New()
     e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
         AllowOrigins: []string{"http://localhost:3000"},
         AllowMethods: []string{echo.GET, echo.POST, echo.PUT, echo.DELETE},
         AllowHeaders: []string{echo.HeaderContentType},
     }))
+
+    //認証API
+    e.POST("/register", register)
+    e.POST("/login", login)
+
     e.GET("/users", getUsers)
     e.POST("/users", createUser)
     e.GET("/health", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
@@ -65,4 +82,63 @@ func createUser(c echo.Context) error {
     }
     db.Create(u)
     return c.JSON(http.StatusOK, u)
+}
+
+func register(c echo.Context) error {
+    type Req struct {
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
+    req := new(Req)
+    if err := c.Bind(req); err != nil {
+        return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+    }
+    
+    // パスワードをハッシュ化
+    hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to hash password"})
+    }
+    
+    account := Account{
+        Username: req.Username,
+        Password: string(hashed),
+    }
+    
+    if err := db.Create(&account).Error; err != nil {
+        return c.JSON(http.StatusConflict, map[string]string{"error": "username already exists"})
+    }
+    
+    return c.JSON(http.StatusOK, map[string]interface{}{
+        "id":       account.ID,
+        "username": account.Username,
+    })
+}
+
+// ログイン
+func login(c echo.Context) error {
+    type Req struct {
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
+    req := new(Req)
+    if err := c.Bind(req); err != nil {
+        return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+    }
+    
+    var account Account
+    if err := db.Where("username = ?", req.Username).First(&account).Error; err != nil {
+        return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+    }
+    
+    // パスワード検証
+    if err := bcrypt.CompareHashAndPassword([]byte(account.Password), []byte(req.Password)); err != nil {
+        return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+    }
+    
+    return c.JSON(http.StatusOK, map[string]interface{}{
+        "id":       account.ID,
+        "username": account.Username,
+        "message":  "login successful",
+    })
 }
